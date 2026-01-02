@@ -1,10 +1,3 @@
-Below is a **more professional GitHub README** **plus a custom LICENSE** that matches exactly what you asked.
-Still clear and simple, but polished.
-
-You can split these into `README.md` and `LICENSE` files.
-
----
-
 # RetroStud
 
 **RetroStud** is a Python-based Roblox launcher designed to **preserve, revive, and make playable old Roblox clients**.
