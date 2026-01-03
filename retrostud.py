@@ -1,4 +1,5 @@
 import os
+import sys
 import subprocess
 import random
 import glob
@@ -7,9 +8,24 @@ import tkinter as tk
 import configparser
 import re
 import shutil
+import threading
+import requests
+import time
+import socket
 import customtkinter as ctk
 from tkinter import PhotoImage
 from tkinter import ttk, filedialog, messagebox
+
+def wait_for_server(ip, port, timeout=30):
+    start_time = time.time()
+    while True:
+        try:
+            with socket.create_connection((ip, int(port)), timeout=1):
+                return True
+        except (ConnectionRefusedError, OSError):
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Server did not start on {ip}:{port} within {timeout}s")
+            time.sleep(0.2)
 
 BASE_DIR = os.getcwd()
 CLIENTS_DIR = os.path.join(BASE_DIR, "Clients")
@@ -23,6 +39,45 @@ webserver_proc = None
 if os.path.exists(WEB_START_BAT):
     webserver_proc = subprocess.Popen([WEB_START_BAT], shell=True)
 atexit.register(lambda: subprocess.Popen([WEB_KILL_BAT], shell=True) if os.path.exists(WEB_KILL_BAT) else None)
+
+def send_soap_execute(ip, port, base_script, job_id="Test", script_name="RanScript", baseurl="roblox.com", http="http"):
+    """
+    Mimics SOAP.ExecuteScript from C#
+    """
+    service = f"{ip}:{port}"
+    content = f"""
+        <ns1:Execute>
+            <ns1:jobID>{job_id}</ns1:jobID>
+            <ns1:script>
+                <ns1:name>{script_name}</ns1:name>
+                <ns1:script>{base_script}</ns1:script>
+                <ns1:arguments>Not Implemented</ns1:arguments>
+            </ns1:script>
+        </ns1:Execute>
+    """
+    soap_envelope = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+                       xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+                       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                       xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                       xmlns:ns1="{http}://{baseurl}/RCCServiceSoap">
+        <SOAP-ENV:Body>
+            {content}
+        </SOAP-ENV:Body>
+    </SOAP-ENV:Envelope>
+    """
+    headers = {
+        "Content-Type": "text/xml",
+        "SOAPAction": "Execute",
+        "Accept": "text/xml",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache"
+    }
+    try:
+        response = requests.post(f"http://{service}", data=soap_envelope.encode("utf-8"), headers=headers)
+        return response.text
+    except Exception as e:
+        return str(e)
 
 ROBLOX_COLORS = [
     ("White", (242, 243, 243)),
@@ -230,6 +285,41 @@ def resource_path(relative_path):
 
 SAVE_DIR = os.path.join("Settings", "BodyColors")
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+def patch_and_send(client_version):
+    SHARED_DIR = "./shared"
+    port = "2005"
+    bodytype = "R6"
+
+    if client_version == "2017M":
+        body_file = os.path.join(SHARED_DIR, "BodyType.txt")
+        if os.path.exists(body_file):
+            bodytype = open(body_file).read().strip()
+
+        template_file = os.path.join(SHARED_DIR, "2017hostog.txt")
+        target_file = os.path.join(SHARED_DIR, "2017host.txt")
+
+        content = open(template_file).read()
+        content = content.replace("%bodytype%", bodytype).replace("%port%", port)
+
+        # Save patched version
+        with open(target_file, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        # Send to server (SOAP call)
+        result = send_soap_execute("localhost", port, content)
+
+    elif client_version == "2008M":
+        template_file = os.path.join(SHARED_DIR, "2008hostoriginal.txt")
+        target_file = os.path.join(SHARED_DIR, "2008host.txt")
+
+        content = open(template_file).read()
+        content = content.replace("%port%", port)
+
+        with open(target_file, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        result = send_soap_execute("localhost", port, content)
 
 def open_body_color_changer():
     if hasattr(open_body_color_changer, "win") and open_body_color_changer.win.winfo_exists():
@@ -527,6 +617,87 @@ def read_body_colors():
 
     return ";".join(colors)
 
+def send_openjob(baseurl, service, base_script, http="http"):
+    # Build XML payload exactly like C# jsonExecute
+    xml_payload = f"""
+<ns1:OpenJob>
+    <ns1:job>
+        <ns1:expirationInSeconds>999999999999</ns1:expirationInSeconds>
+        <ns1:id>{base_script}</ns1:id>
+    </ns1:job>
+    <ns1:script>
+        <ns1:name>{base_script}</ns1:name>
+        <ns1:script>{base_script}</ns1:script>
+        <ns1:arguments>Not Implemented</ns1:arguments>
+    </ns1:script>
+</ns1:OpenJob>
+""".strip()
+
+    # Wrap in SOAP envelope
+    soap_envelope = f"""<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+                   xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                   xmlns:ns1="{http}://{baseurl}/"
+                   xmlns:ns2="{http}://{baseurl}/RCCServiceSoap"
+                   xmlns:ns3="{http}://{baseurl}/RCCServiceSoap12">
+    <SOAP-ENV:Body>
+        {xml_payload}
+    </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
+
+    url = f"http://{service}/OpenJob"
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": "OpenJob"
+    }
+
+    response = requests.post(url, data=soap_envelope.encode("utf-8"), headers=headers)
+
+def send_openjob_2008(script, ip="127.0.0.1", port=64989, baseurl="localhost", http="http"):
+    """
+    Mimics the old 2008M SOAP2.OpenJob call.
+    Sends a SOAP request using the legacy 2008M format.
+    """
+    xml_payload = f"""
+<ns1:OpenJob>
+  <ns1:job>
+    <ns1:id>Test</ns1:id>
+    <ns1:expirationInSeconds>600000</ns1:expirationInSeconds>
+    <ns1:someOtherField>0</ns1:someOtherField>
+  </ns1:job>
+  <ns1:script>
+    <ns1:name>GameServer</ns1:name>
+    <ns1:script>{script}</ns1:script>
+    <ns1:arguments>...</ns1:arguments>
+  </ns1:script>
+</ns1:OpenJob>
+""".strip()
+
+    # Build full SOAP envelope
+    soap_envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" '
+        'xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        f'xmlns:ns1="{http}://localhost//" '
+        f'xmlns:ns2="{http}://{baseurl}/RCCServiceSoap" '
+        f'xmlns:ns3="{http}://{baseurl}/RCCServiceSoap12">\n'
+        '    <SOAP-ENV:Body>\n'
+        f'{xml_payload}\n'
+        '    </SOAP-ENV:Body>\n'
+        '</SOAP-ENV:Envelope>'
+    )
+
+    url = f"http://{ip}:{port}/RCCServiceSoap"
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": "OpenJob"
+    }
+
+    response = requests.post(url, data=soap_envelope.encode("utf-8"), headers=headers)
 def read_appearance():
     path = os.path.join("Settings", "Appearence.ini")
 
@@ -550,6 +721,10 @@ def save_setting(file_name, value):
     os.makedirs(SETTINGS_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(str(value))
+
+def save_port_files(value):
+    save_setting("clientport.txt", value)
+    save_setting("HostPort.txt", value)
 
 def read_setting(file_name, default=""):
     path = os.path.join(SETTINGS_DIR, file_name)
@@ -629,16 +804,190 @@ def select_map():
 
 def launch_server(client_version):
     global server_proc
-    server_bat = os.path.join(SHARED_DIR, f"{client_version}.bat")
-    if os.path.exists(server_bat):
-        server_proc = subprocess.Popen(f'start cmd /k "{server_bat}"', shell=True)
+
+    port = read_setting("HostPort.txt", "2005")
+
+    # Read body type
+    body_type_file = os.path.join(SHARED_DIR, "BodyType.txt")
+    if os.path.exists(body_type_file):
+        with open(body_type_file, "r", encoding="utf-8") as f:
+            body_type = f.read().strip() or "R6"
     else:
-        messagebox.showwarning("Warning", f"No server bat found for {client_version}")
+        body_type = "R6"
+
+    # Copy and patch ServerScript.txt
+    src_script = os.path.join(os.path.dirname(SHARED_DIR), "Settings", "ServerScript.txt")
+    dst_script = os.path.join(SHARED_DIR, "content", "scripts", "CoreScripts", "ServerStarterScript.lua")
+    os.makedirs(os.path.dirname(dst_script), exist_ok=True)
+    shutil.copy(src_script, dst_script)
+    with open(dst_script, "r", encoding="utf-8") as f:
+        script_content = f.read()
+    script_content = script_content.replace("%bodytype%", body_type)
+    with open(dst_script, "w", encoding="utf-8") as f:
+        f.write(script_content)
+
+    # --- Special 2017M handling ---
+    if client_version == "2017M":
+        template_file = os.path.join(SHARED_DIR, "2017hostog.txt")
+        target_file = os.path.join(SHARED_DIR, "2017host.txt")
+        with open(template_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        content = content.replace("%bodytype%", body_type).replace("%port%", str(port))
+        with open(target_file, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        # Launch using full system32 cmd path in a new console
+        bat_path = os.path.join(SHARED_DIR, f"{client_version}.bat")
+        server_proc = subprocess.Popen(
+            [r"C:\Windows\system32\cmd.exe", "/K", bat_path],
+            cwd=SHARED_DIR,
+            creationflags=subprocess.CREATE_NEW_CONSOLE
+        )
+        def wait_and_send():
+            # Poll port without blocking GUI
+            while True:
+                try:
+                    with socket.create_connection(("127.0.0.1", "64989"), timeout=1):
+                        break
+                except OSError:
+                    pass  # Port not open yet, keep trying
+
+            # Launch via JSON-style OpenJob SOAP call
+            print("[2017M] Sending host script via OpenJob SOAP")
+            send_openjob(baseurl="roblox.com", service=f"127.0.0.1:64989", base_script=content)
+
+        threading.Thread(target=wait_and_send, daemon=True).start()
+        return
+
+    # --- Special 2008M handling ---
+    if client_version == "2008M":
+        template_file = os.path.join(SHARED_DIR, "2008hostoriginal.txt")
+        target_file = os.path.join(SHARED_DIR, "2008host.txt")
+        with open(template_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        content = content.replace("%port%", str(port))
+        with open(target_file, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        bat_path = os.path.join(SHARED_DIR, f"{client_version}.bat")
+        if not os.path.exists(bat_path):
+            messagebox.showerror("Error", f"BAT not found:\n{bat_path}")
+            return
+        server_proc = subprocess.Popen(
+            [r"C:\Windows\system32\cmd.exe", "/K", bat_path],
+            cwd=SHARED_DIR,
+            creationflags=subprocess.CREATE_NEW_CONSOLE
+        )
+        print("[2008M] Server launched, waiting a few seconds to ensure it starts...")
+        def wait_and_send():
+            # Poll port without blocking GUI
+            while True:
+                try:
+                    with socket.create_connection(("127.0.0.1", "64989"), timeout=1):
+                        break
+                except OSError:
+                    pass  # Port not open yet, keep trying
+
+            # Launch via JSON-style OpenJob SOAP call
+            send_openjob_2008(script=content, ip="127.0.0.1", port=64989, baseurl="roblox.com", http="http")
+        threading.Thread(target=wait_and_send, daemon=True).start()
+        return
+
+    # --- Normal handling for other clients ---
+    bat_path = os.path.join(SHARED_DIR, f"{client_version}.bat")
+    if not os.path.exists(bat_path):
+        messagebox.showerror("Error", f"BAT not found:\n{bat_path}")
+        return
+
+    with open(bat_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    raw_cmd = None
+    for line in lines:
+        line = line.strip()
+        if not line or line.lower().startswith(("cd ", "cls", "pause", "echo")):
+            continue
+        if ".exe" in line.lower():
+            raw_cmd = line
+            break
+    if not raw_cmd:
+        messagebox.showerror("Error", "No executable line found in BAT")
+        return
+    raw_cmd = raw_cmd.replace("64989", str(port))
+
+    # Special patch for 2022M
+    if client_version == "2022M":
+        place_path = os.path.join(SHARED_DIR, "content", "place.rbxl")
+        raw_cmd = raw_cmd.replace("<file>", f'"{place_path}"')
+        raw_cmd = raw_cmd.replace("RobloxStudioBeta.exe", os.path.join(CLIENTS_DIR, "2022M", "RobloxStudioBeta.exe"))
+
+    # Launch in a new cmd window
+    server_proc = subprocess.Popen(
+        f'start "" cmd /k {raw_cmd}',
+        shell=True,
+        cwd=SHARED_DIR
+    )
+
+def launch_old_client(client_version, ip, port, session_id, app_data, username):
+    bat_file = os.path.join(SHARED_DIR, f"{client_version}Client.bat")
+    
+    with open(bat_file, "r") as f:
+        bat_content = f.read()
+
+    # Replace placeholders in memory
+    bat_content = bat_content.replace("{ip}", ip)
+    bat_content = bat_content.replace("{port}", str(port))
+    bat_content = bat_content.replace("{session_id}", str(session_id))
+    bat_content = bat_content.replace("{app_data}", app_data)
+    bat_content = bat_content.replace("{username}", username)
+
+    # Save temporary bat file to launch (optional: could also run via stdin)
+    temp_bat = os.path.join(SHARED_DIR, f"{client_version}_temp.bat")
+    with open(temp_bat, "w") as f:
+        f.write(bat_content)
+
+    # Launch it like a “normal” process
+    subprocess.Popen(["cmd.exe", "/c", temp_bat], cwd=SHARED_DIR)
 
 def launch_client(client_version):
+    if client_version == "2022M":
+        username = read_setting("username.txt", "Default")
+        ip = read_setting("ip.txt", "localhost")
+        port = read_setting("clientport.txt", "2005")
+        session_id = random_id()
+
+        app_data = build_app_arg()
+        quote = '"'
+        ip = read_setting("ip.txt", "localhost")
+        port = read_setting("clientport.txt", "2005")
+
+        studio = os.path.join(CLIENTS_DIR, "2022M", "RobloxStudioBeta.exe")
+
+        if not os.path.exists(studio):
+            messagebox.showerror("Error", "RobloxStudioBeta.exe not found for 2022M")
+            return
+
+        cmd = (
+            f'"{studio}" '
+            f'-task StartClient '
+            f'-server {ip} '
+            f'-port {port}'
+        )
+
+        subprocess.Popen(cmd, shell=True)
+        return
+
     client_exec = find_client_executable(client_version)
     if not client_exec and client_version == "2015L":
         client_exec = os.path.join(".", "shared", "2015Player.exe")
+
+    if not client_exec and client_version == "2017M":
+        client_exec = os.path.join(".", "shared", "2017Player.exe")
+
+    if client_version == "2013L":
+        client_exec = os.path.join(".", "Clients", "2013L", "RobloxPlayerBeta.exe")
+
+    if client_version == "2014M":
+        client_exec = os.path.join(".", "Clients", "2014M", "RobloxPlayerBeta.exe")
     
     if not client_exec:
         messagebox.showerror("Error", f"Could not find executable or bat for client {client_version}")
@@ -650,9 +999,9 @@ def launch_client(client_version):
     except Exception as e:
         messagebox.showerror("Error", f"Failed to launch client: {e}")
 
-    username = username_var.get() or "Player"
-    ip = ip_var.get() or "localhost"
-    port = port_var.get() or "2005"
+    username = read_setting("username.txt", "Default")
+    ip = read_setting("ip.txt", "localhost")
+    port = read_setting("clientport.txt", "2005")
     session_id = random_id()
 
     app_data = build_app_arg()
@@ -665,14 +1014,64 @@ def launch_client(client_version):
 
     # ---- VERSION-SPECIFIC LOGIC ----
     if client_version in ("2015L", "2016L"):
-        join = (
-            f"http://{ip}/game/placelaunchrrr.php/?"
-            f"placeid=1818&ip={ip}&port={port}&id={session_id}"
-            f"&app={app_data}&user={username}"
+        launch_old_client(
+            client_version=client_version,
+            ip=ip,
+            port=port,
+            session_id=session_id,
+            app_data=app_data,
+            username=username
         )
-        auth = f"http://{ip}/login/negotiate.ashx"
+        return
 
-    elif client_version == "2017M":
+    if client_version == "2008M":
+        CLIENTS_DIR = os.path.join(BASE_DIR, "Clients")
+
+        player_dir = os.path.join(CLIENTS_DIR, "2008M", "Player")
+        content_dir = os.path.join(player_dir, "content")
+
+        src_join = os.path.join(CLIENTS_DIR, "2008M", "join.txt")
+        dst_join = os.path.join(content_dir, "join.txt")
+
+        os.makedirs(content_dir, exist_ok=True)
+
+        # 1. copy join.txt
+        shutil.copyfile(src_join, dst_join)
+
+        # 2. read file
+        with open(dst_join, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        # 3. replace placeholders everywhere
+        text = text.replace("%user%", f"\"{username}\"")
+        text = text.replace("%ip%", f"\"{ip}\"")
+        text = text.replace("%port%", str(port))
+        text = text.replace("%id%", str(session_id))
+
+        # 4. replace FIRST LINE only
+        lines = text.splitlines(keepends=True)
+        lines[0] = f"local charapp = [[{app_data}]]\n"
+        text = "".join(lines)
+
+        # 5. write back
+        with open(dst_join, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        # 6. launch Roblox
+        roblox_exe = os.path.join(player_dir, "Roblox.exe")
+
+        subprocess.Popen(
+            [
+                roblox_exe,
+                "-script",
+                "dofile('rbxasset://join.txt')"
+            ],
+            cwd=player_dir,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        return
+    if client_version == "2017M":
         join = (
             f"http://{ip}/game/join.php/?"
             f"placeid=1818&ip={ip}&port={port}&id={session_id}"
@@ -688,6 +1087,19 @@ def launch_client(client_version):
             f"&port={port}&id={session_id}&app={app_data}"
         )
         auth = f"http://{ip}/2021/login/negotiate.ashx"
+    elif client_version in ("2013L", "2014M"):
+        app_data = app_data.replace("1111111", "")
+        join = (
+            f"http://{ip}/www.civdefn.tk/game/join.php?"
+            f"port={port}"
+            f"&app={app_data}"
+            f"&ip={ip}"
+            f"&username={username}"
+            f"&id={session_id}"
+            f"&mode=1"
+        )
+
+        auth = f"http://{ip}/www.civdefn.tk/"
 
     elif client_version.startswith("2019"):
         join = (
@@ -751,14 +1163,29 @@ ctk.CTkLabel(config_frame, text="Configuration:", anchor="w").pack(fill="x", pad
 
 ctk.CTkLabel(config_frame, text="IP:", anchor="w").pack(fill="x", pady=(5,0))
 ip_var = ctk.StringVar(value=read_setting("ip.txt", "localhost"))
+def on_ip_change(*args):
+    save_setting("ip.txt", ip_var.get())
+
+ip_var.trace_add("write", on_ip_change)
+
 ctk.CTkEntry(config_frame, textvariable=ip_var).pack(fill="x", pady=(0,2))
 
 ctk.CTkLabel(config_frame, text="Port:", anchor="w").pack(fill="x", pady=(5,0))
+
 port_var = ctk.StringVar(value=read_setting("clientport.txt", "2005"))
+def on_port_change(*args):
+    save_port_files(port_var.get())
+
+port_var.trace_add("write", on_port_change)
+
 ctk.CTkEntry(config_frame, textvariable=port_var).pack(fill="x", pady=(0,2))
 
 ctk.CTkLabel(config_frame, text="Username:", anchor="w").pack(fill="x", pady=(5,0))
 username_var = ctk.StringVar(value=read_setting("username.txt", "Player"))
+def on_name_change(*args):
+    save_setting("username.txt", username_var.get())
+
+username_var.trace_add("write", on_name_change)
 ctk.CTkEntry(config_frame, textvariable=username_var).pack(fill="x", pady=(0,2))
 
 FE_var = ctk.StringVar(value=load_FE_type())
